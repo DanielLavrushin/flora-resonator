@@ -157,7 +157,7 @@ local function scan_pickups(center, radius)
 end
 
 
-local function scan_cuttables(center, radius)
+local function scan_cuttables(center, radius, skipKeys)
     local hits = {}
     if not center or not radius then return hits end
     local sn2 = get_sn2_statics()
@@ -167,14 +167,23 @@ local function scan_cuttables(center, radius)
     if not all then return hits end
     for _, a in pairs(all) do
         if U.is_valid(a) then
-            local loc = U.actor_location(a)
-            if loc then
-                local d2 = U.vec_dist_sq(center, loc)
-                if d2 and d2 <= r2 and not loc_is_recent(loc) then
-                    local ok = false
-                    pcall(function() ok = sn2:IsActorCuttable(a) end)
-                    if ok and plant_ready(a) then
-                        table.insert(hits, { actor = a, dist2 = d2 })
+            -- SN2PickupItem is already handled by scan_pickups via the safe
+            -- router:PickupActor path. Plants on farm trays satisfy both
+            -- queries; routing them through the destroy-then-spawn cuttable
+            -- path destroys the live plant and is what ate users' farms.
+            local cn = U.class_name(a)
+            local is_pickup_class = (cn == "SN2PickupItem")
+            local key = is_pickup_class and "" or actor_key(a)
+            if not is_pickup_class and not (skipKeys and skipKeys[key]) then
+                local loc = U.actor_location(a)
+                if loc then
+                    local d2 = U.vec_dist_sq(center, loc)
+                    if d2 and d2 <= r2 and not loc_is_recent(loc) then
+                        local ok = false
+                        pcall(function() ok = sn2:IsActorCuttable(a) end)
+                        if ok and plant_ready(a) then
+                            table.insert(hits, { actor = a, dist2 = d2 })
+                        end
                     end
                 end
             end
@@ -265,16 +274,27 @@ local function read_cuttable_info(actor, sn2)
     return data, hits, res_cls
 end
 
+local function pickup_call(router, actor)
+    if not U.is_valid(router) or not U.is_valid(actor) then return false end
+    local ok, result = pcall(function() return router:PickupActor(actor, {}) end)
+    if not ok then return false end
+    if result == false then return false end
+    return true
+end
+
+-- Returns (harvested, inventoryFull). On inventory full, spawned items are
+-- cleaned up and the source cuttable is left intact so the player can come
+-- back for it once they free a slot.
 local function harvest_one_cuttable(cuttable, pawn, router, sn2, postSpawnStagger)
     postSpawnStagger = postSpawnStagger or 80
-    if not U.is_valid(cuttable) then return false end
+    if not U.is_valid(cuttable) then return false, false end
 
     local data, n_hits, res_cls = read_cuttable_info(cuttable, sn2)
-    if not data then return false end
-    if not U.is_valid(res_cls) then return false end
+    if not data then return false, false end
+    if not U.is_valid(res_cls) then return false, false end
 
     local transform = build_actor_transform(cuttable)
-    if not transform then return false end
+    if not transform then return false, false end
 
     local impulse = { X = 0.0, Y = 0.0, Z = 100.0 }
     local spawned = {}
@@ -285,9 +305,23 @@ local function harvest_one_cuttable(cuttable, pawn, router, sn2, postSpawnStagge
         end)
         if U.is_valid(item) then
             table.insert(spawned, item)
-            dedup_remember(item)
         end
     end
+
+    if #spawned == 0 then return false, false end
+
+    -- Probe inventory by trying the first pickup synchronously. If it fails,
+    -- inventory is full: don't destroy the source, and clean up the spawned
+    -- items we couldn't deliver so the world isn't littered.
+    if not pickup_call(router, spawned[1]) then
+        for _, item in ipairs(spawned) do
+            if U.is_valid(item) then
+                pcall(function() item:K2_DestroyActor() end)
+            end
+        end
+        return false, true
+    end
+    dedup_remember(spawned[1])
 
     dedup_remember(cuttable)
     do
@@ -296,25 +330,28 @@ local function harvest_one_cuttable(cuttable, pawn, router, sn2, postSpawnStagge
     end
     pcall(function() cuttable:K2_DestroyActor() end)
 
-    for i, item in ipairs(spawned) do
+    for i = 2, #spawned do
+        local item = spawned[i]
         local capturedGen = mapGen
         if postSpawnStagger <= 0 then
             if U.is_valid(item) then
-                pcall(function() router:PickupActor(item, {}) end)
+                pickup_call(router, item)
+                dedup_remember(item)
             end
         else
-            ExecuteWithDelay(postSpawnStagger * i, function()
+            ExecuteWithDelay(postSpawnStagger * (i - 1), function()
                 ExecuteInGameThread(function()
                     if isShuttingDown or capturedGen ~= mapGen then return end
                     if U.is_valid(item) then
-                        pcall(function() router:PickupActor(item, {}) end)
+                        pickup_call(router, item)
+                        dedup_remember(item)
                     end
                 end)
             end)
         end
     end
 
-    return true
+    return true, false
 end
 
 local function schedule_cuttable_harvest(cuttables, pawn, router, sn2, gen, stagger, postSpawnStagger)
@@ -328,7 +365,8 @@ local function schedule_cuttable_harvest(cuttables, pawn, router, sn2, gen, stag
         if i > total then return end
         local c = cuttables[i]
         if c and U.is_valid(c.actor) and not dedup_is_picked(c.actor) then
-            harvest_one_cuttable(c.actor, pawn, router, sn2, postSpawnStagger)
+            local _, inventoryFull = harvest_one_cuttable(c.actor, pawn, router, sn2, postSpawnStagger)
+            if inventoryFull then return end
         end
 
         if stagger <= 0 then
@@ -344,26 +382,28 @@ local function schedule_cuttable_harvest(cuttables, pawn, router, sn2, gen, stag
 end
 
 
-local function try_pickup(router, actor)
-    if not U.is_valid(router) or not U.is_valid(actor) then return false end
-    local hit = {}
-    local ok = pcall(function() router:PickupActor(actor, hit) end)
-    return ok
-end
-
 local function schedule_pickups(router, hits, gen, stagger)
     stagger = stagger or Config.PickupStaggerMs or 0
     local cap = Config.MaxPerBurst or 0
     local total   = (cap > 0 and math.min(cap, #hits)) or #hits
+
+    -- Track consecutive pickup failures: if the actor was valid but the call
+    -- failed, the inventory is likely full. Stop the burst rather than
+    -- thrashing through every remaining item.
+    local consecutiveFails = 0
 
     local function step(i)
         if isShuttingDown or gen ~= mapGen then return end
         if i > total then return end
         local h = hits[i]
         if h and U.is_valid(h.actor) and not dedup_is_picked(h.actor) then
-            if try_pickup(router, h.actor) then
+            if pickup_call(router, h.actor) then
                 dedup_remember(h.actor)
                 if h.loc then remember_loc(h.loc) end
+                consecutiveFails = 0
+            else
+                consecutiveFails = consecutiveFails + 1
+                if consecutiveFails >= 2 then return end
             end
         end
 
@@ -383,8 +423,17 @@ end
 local function on_burst(center, radius, pickupStagger, cuttableStagger, postSpawnStagger)
     if not Config.EnablePickup then return end
 
-    local hits      = scan_pickups(center, radius)
-    local cuttables = scan_cuttables(center, radius)
+    local hits = scan_pickups(center, radius)
+
+    local cuttables = {}
+    if Config.EnableCuttable then
+        local pickupKeys = {}
+        for _, h in ipairs(hits) do
+            pickupKeys[actor_key(h.actor)] = true
+        end
+        cuttables = scan_cuttables(center, radius, pickupKeys)
+    end
+
     if #hits == 0 and #cuttables == 0 then return end
 
     local pawn = U.get_pawn()
@@ -396,7 +445,7 @@ local function on_burst(center, radius, pickupStagger, cuttableStagger, postSpaw
         schedule_pickups(router, hits, mapGen, pickupStagger)
     end
 
-    if Config.EnableCuttable and #cuttables > 0 then
+    if #cuttables > 0 then
         local sn2 = get_sn2_statics()
         if sn2 then
             schedule_cuttable_harvest(cuttables, pawn, router, sn2, mapGen,
@@ -468,9 +517,12 @@ local function try_install_pop_hook(attempt, gen)
         hookInstalled = true
         return
     end
-    if attempt >= 60 then return end
+    if attempt >= (Config.HookInstallMaxAttempts or 30) then return end
     ExecuteWithDelay(1000, function()
-        ExecuteInGameThread(function() try_install_pop_hook(attempt + 1, gen) end)
+        ExecuteInGameThread(function()
+            if isShuttingDown or gen ~= mapGen then return end
+            try_install_pop_hook(attempt + 1, gen)
+        end)
     end)
 end
 
@@ -549,9 +601,12 @@ local function try_install_v1_blast_hook(attempt, gen)
         v1HookInstalled = true
         return
     end
-    if attempt >= 60 then return end
+    if attempt >= (Config.HookInstallMaxAttempts or 30) then return end
     ExecuteWithDelay(1000, function()
-        ExecuteInGameThread(function() try_install_v1_blast_hook(attempt + 1, gen) end)
+        ExecuteInGameThread(function()
+            if isShuttingDown or gen ~= mapGen then return end
+            try_install_v1_blast_hook(attempt + 1, gen)
+        end)
     end)
 end
 
