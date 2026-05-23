@@ -626,7 +626,19 @@ end
 
 -- ── Per-burst handler ────────────────────────────────────────────────────
 
-local function on_burst(center, radius)
+local function on_burst(center, radius, toolName, playerLoc)
+    -- One-line tag identifying which resonator fired and how far the pop
+    -- happened from the player. V1 fires the orb at the player's hand and
+    -- pops close; V2 lobs it and pops far. Behavior differences (cuttable
+    -- silently failing, pickups getting ejected) correlate with version.
+    local distStr = "?"
+    if playerLoc then
+        local d2 = U.vec_dist_sq(center, playerLoc)
+        if d2 then distStr = string.format("%.0f", math.sqrt(d2)) end
+    end
+    U.logf("Pop: tool=%s pop@(%.0f,%.0f,%.0f) playerDist=%s r=%.0f",
+        tostring(toolName or "?"), center.X, center.Y, center.Z, distStr, radius)
+
     -- Pickup probe (SN2PickupItem — proven path)
     local hits = scan_pickups(center, radius)
     log_class_tally(string.format("Pop @ r=%.0f", radius), hits)
@@ -692,14 +704,32 @@ local function on_pop_sync(self)
     lastPopMs = t
 
     local cx, cy, cz
+    local toolName, playerLoc
     pcall(function()
         local proj = self:get()
         if not (proj and proj:IsValid()) then return end
         local loc = proj:K2_GetActorLocation()
         if loc and type(loc.X) == "number" then cx, cy, cz = loc.X, loc.Y, loc.Z end
+        -- Capture the firing tool's class so logs distinguish V1 from V2.
+        -- Must be done sync while `self` is valid — defer-then-read would
+        -- read stale memory.
+        local owner = U.try(function() return proj:GetOwner() end)
+        if U.is_valid(owner) then
+            toolName = U.try(function() return owner:GetClass():GetFName():ToString() end)
+        end
     end)
 
     if not cx then return end
+
+    -- Capture player location too, so the burst log can show how far the
+    -- pop happened from the player (V1 pops close, V2 pops far).
+    do
+        local pawn = U.get_pawn()
+        if U.is_valid(pawn) then
+            local pl = U.actor_location(pawn)
+            if pl then playerLoc = pl end
+        end
+    end
 
     -- Radius priority: explicit override → CDO vanilla → fallback.
     -- Deliberately ignore proj.SonicBubblePopRadius because Permafrost &
@@ -717,7 +747,7 @@ local function on_pop_sync(self)
     ExecuteWithDelay(0, function()
         ExecuteInGameThread(function()
             if isShuttingDown or capturedGen ~= mapGen then return end
-            on_burst({ X = cx, Y = cy, Z = cz }, radius)
+            on_burst({ X = cx, Y = cy, Z = cz }, radius, toolName, playerLoc)
         end)
     end)
 end
@@ -755,6 +785,147 @@ local function try_install_pop_hook(attempt, gen)
     end)
 end
 
+-- ── V1 blast hook ────────────────────────────────────────────────────────
+-- V1 (BP_SonicResonator_C) does NOT spawn BP_SonicBubbleProjectile_C — it
+-- triggers a close-range blast via a GameplayCue (no traveling projectile).
+-- (V2 / Upgraded uses GC_SonicResonator_SecondaryBlast and the projectile
+-- path, so the two don't collide.)
+--
+-- Hook target: `GameplayCueNotify_Static:OnExecute` — the cue manager's
+-- one-shot dispatch entry. UWE's `OnBurst` (one level closer to the BP)
+-- looked promising but never fires here; OnExecute is the real entry.
+-- This catches EVERY one-shot cue in the game, so we filter by class
+-- FName on the cue notify instance.
+--
+-- V1 is close-range so the player's location is a fine approximation of
+-- the blast center — no need to extract precise coords from cue params.
+-- We share `lastPopMs` with the Pop hook so V2 doesn't double-trigger if
+-- it happens to fire a SonicResonator cue too.
+
+-- The cue notify dispatch (OnExecute/OnActive on GameplayCueNotify_*)
+-- isn't hookable for this class — GC_SonicResonator_Blast_C has no
+-- UFunctions and the C++ side reads its struct properties directly
+-- without a ProcessEvent call. So we hook UPSTREAM of the cue notify:
+-- the AbilitySystemComponent's NetMulticast_InvokeGameplayCueExecuted
+-- RPCs, which carry the GameplayCueTag (FGameplayTag struct with a
+-- TagName FName).
+--
+-- The expected tag for V1's blast follows UE's convention of mapping
+-- a cue notify class GC_X_Y_Z_C to tag GameplayCue.X.Y.Z. Diagnostic
+-- logging surfaces the actual tag if the convention differs.
+
+-- Cue tag confirmed by in-game probe: `GameplayCue.Tools.SonicResonator.Blast`
+-- fires when V1's close-range blast goes off. (The `.Tools.` namespace is
+-- the SN2 grouping convention — not the bare `GameplayCue.SonicResonator.*`
+-- we initially guessed.)
+local V1_BLAST_TAG = "GameplayCue.Tools.SonicResonator.Blast"
+local v1HookInstalled = false
+
+local function on_v1_blast_sync(self, GameplayCueTag)
+    if isShuttingDown then return end
+    if not (Config.EnableV1Hook == true) then return end
+
+    -- Extract tag name. UE4SS hands FGameplayTag as a LocalUnrealParam
+    -- userdata — direct field access works after pcall. Keep a couple of
+    -- fallbacks in case a future build changes the binding shape.
+    local tagName
+    pcall(function() tagName = GameplayCueTag.TagName:ToString() end)
+    if not tagName then
+        pcall(function() tagName = GameplayCueTag:get().TagName:ToString() end)
+    end
+    if not tagName or tagName == "" then return end
+
+    if tagName ~= V1_BLAST_TAG then return end
+
+    -- Share debounce with the Pop path. UE4SS often fires hooks twice
+    -- (pre/post); a shared window also suppresses an accidental V2 cue
+    -- firing right after its own Pop.
+    local t = now_ms()
+    if t - lastPopMs < (Config.PopDebounceMs or 500) then
+        U.dlogf("V1 blast suppressed (within debounce, dt=%dms)", t - lastPopMs)
+        return
+    end
+    lastPopMs = t
+
+    -- Player location = burst center. V1 is close-range.
+    local cx, cy, cz
+    do
+        local pawn = U.get_pawn()
+        if not U.is_valid(pawn) then return end
+        local loc = U.actor_location(pawn)
+        if not loc then return end
+        cx, cy, cz = loc.X, loc.Y, loc.Z
+    end
+
+    local radius = (Config.V1Radius and Config.V1Radius > 0)
+        and Config.V1Radius
+        or 350.0
+
+    dedup_gc()
+
+    local capturedGen = mapGen
+    local playerLoc   = { X = cx, Y = cy, Z = cz }
+    ExecuteWithDelay(0, function()
+        ExecuteInGameThread(function()
+            if isShuttingDown or capturedGen ~= mapGen then return end
+            on_burst(playerLoc, radius, "V1_Blast", playerLoc)
+        end)
+    end)
+end
+
+-- Multiple cue dispatch entry points. We don't know which one V1 uses;
+-- hook each with a distinct `src` tag so the diagnostic shows which path
+-- actually fires.
+-- Hook the ASC's RPC dispatch points. Each carries a GameplayCueTag (or
+-- container) we can read from the Lua callback args. Different SN2 paths
+-- may use different overloads — register all three with `src` tags.
+local V1_HOOK_PATHS = {
+    { path = "/Script/GameplayAbilities.AbilitySystemComponent:NetMulticast_InvokeGameplayCueExecuted_WithParams", src = "ASC:Cue+Params" },
+    { path = "/Script/GameplayAbilities.AbilitySystemComponent:NetMulticast_InvokeGameplayCueExecuted",            src = "ASC:Cue"        },
+    { path = "/Script/GameplayAbilities.AbilitySystemComponent:NetMulticast_InvokeGameplayCueExecuted_FromSpec",   src = "ASC:CueFromSpec"},
+}
+
+local function register_v1_blast_hook()
+    for _, h in ipairs(V1_HOOK_PATHS) do
+        local ok, err = pcall(function()
+            -- UE4SS Lua hook arg unpacking: (self, arg1, arg2, ...). For
+            -- these RPCs the first arg is the FGameplayTag.
+            RegisterHook(h.path, function(self, GameplayCueTag)
+                on_v1_blast_sync(self, GameplayCueTag)
+            end)
+        end)
+        if ok then
+            U.logf("hooked %s (src=%s)", h.path, h.src)
+        else
+            U.logf("FAILED hook %s: %s", h.path, tostring(err))
+        end
+    end
+    U.logf("V1 cue tag diag active (target tag: %s)", V1_BLAST_TAG)
+end
+
+local function try_install_v1_blast_hook(attempt, gen)
+    attempt = attempt or 1
+    gen     = gen or mapGen
+    if isShuttingDown or gen ~= mapGen or v1HookInstalled then return end
+    if not (Config.EnableV1Hook == true) then return end
+    -- AbilitySystemComponent is native (GAS module), always loaded early.
+    local cls = U.try(function()
+        return StaticFindObject("/Script/GameplayAbilities.AbilitySystemComponent")
+    end)
+    if U.is_valid(cls) then
+        register_v1_blast_hook()
+        v1HookInstalled = true
+        return
+    end
+    if attempt >= 60 then
+        U.logf("gave up waiting for AbilitySystemComponent after %d tries", attempt)
+        return
+    end
+    ExecuteWithDelay(1000, function()
+        ExecuteInGameThread(function() try_install_v1_blast_hook(attempt + 1, gen) end)
+    end)
+end
+
 -- ── Map lifecycle ────────────────────────────────────────────────────────
 
 pcall(function()
@@ -766,15 +937,17 @@ RegisterLoadMapPostHook(function()
     Config       = require("config")
     enablePickup = Config.EnablePickup == true
 
-    isShuttingDown = true
-    mapGen         = mapGen + 1
-    hookInstalled  = false
-    lastPopMs      = 0
-    pickedRecent   = {}
-    recentLocs     = {}
-    isShuttingDown = false
+    isShuttingDown   = true
+    mapGen           = mapGen + 1
+    hookInstalled    = false
+    v1HookInstalled  = false
+    lastPopMs        = 0
+    pickedRecent     = {}
+    recentLocs       = {}
+    isShuttingDown   = false
 
     try_install_pop_hook(1, mapGen)
+    try_install_v1_blast_hook(1, mapGen)
 end)
 
 -- ── Manual dump ─────────────────────────────────────────────────────────
@@ -854,3 +1027,4 @@ U.logf("loaded v%s — EnablePickup=%s (toggle: %s)",
     Config.VERSION, tostring(enablePickup),
     Config.PickupToggleKey ~= "" and Config.PickupToggleKey or "config only")
 try_install_pop_hook(1, mapGen)
+try_install_v1_blast_hook(1, mapGen)

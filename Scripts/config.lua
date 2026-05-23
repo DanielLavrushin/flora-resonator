@@ -89,6 +89,17 @@ return {
     -- > 0 to force a specific radius regardless of CDO / Permafrost.
     RadiusOverride = 0.0,
 
+    -- V1 (basic Sonic Resonator) support. V1 doesn't fire a projectile —
+    -- it does an instant close-range blast via the GC_SonicResonator_Blast
+    -- gameplay cue. We hook that cue's OnBurst and run the same harvest
+    -- pipeline, using the player's location as the burst center.
+    EnableV1Hook = true,
+
+    -- Burst radius (cm) for the V1 blast. V1 is close-range so the player
+    -- is near anything they want to harvest — keep this modest. 350 covers
+    -- roughly the area immediately in front of the player.
+    V1Radius     = 350.0,
+
     -- Diagnostic scans: cap classes printed per probe (avoids 500-line
     -- spam in dense biomes). 0 = no cap.
     MaxLogPerScan = 30,
