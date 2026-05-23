@@ -135,6 +135,51 @@ local function plant_ready(actor)
 end
 
 
+local kismetSysLibCdo = nil
+
+local function get_kismet_sys_lib()
+    if U.is_valid(kismetSysLibCdo) then return kismetSysLibCdo end
+    local c = U.try(function()
+        return StaticFindObject("/Script/Engine.Default__KismetSystemLibrary")
+    end)
+    if U.is_valid(c) then kismetSysLibCdo = c; return c end
+    c = U.try(function() return FindFirstOf("KismetSystemLibrary") end)
+    if U.is_valid(c) then kismetSysLibCdo = c; return c end
+    return nil
+end
+
+-- Per-actor memoization. The expensive C++ calls per shot were class_name
+-- and IsActorCuttable on every actor in the world. These results are stable
+-- for the lifetime of the actor, so we cache by full-name key. Cuttables in
+-- the world are usually static (coral, gorgon, anemone), so first shot pays
+-- the full price and every shot after that is fast.
+local classNameCache  = {}
+local cuttableYes     = {}
+local cuttableNo      = {}
+
+local function clear_actor_caches()
+    classNameCache = {}
+    cuttableYes    = {}
+    cuttableNo     = {}
+end
+
+local function cached_class_name(a, k)
+    local cached = classNameCache[k]
+    if cached ~= nil then return cached end
+    local cn = U.class_name(a)
+    classNameCache[k] = cn or ""
+    return classNameCache[k]
+end
+
+local function cached_is_cuttable(sn2, a, k)
+    if cuttableYes[k] then return true end
+    if cuttableNo[k]  then return false end
+    local ok = false
+    pcall(function() ok = sn2:IsActorCuttable(a) end)
+    if ok then cuttableYes[k] = true else cuttableNo[k] = true end
+    return ok
+end
+
 local function scan_pickups(center, radius)
     local hits = {}
     if not center or not radius then return hits end
@@ -157,33 +202,39 @@ local function scan_pickups(center, radius)
 end
 
 
+-- Cuttable scan: we have to walk every actor because cuttables like the
+-- Curtain Gorgon respond only to trace queries, not collision overlap, so a
+-- SphereOverlapActors fast path silently misses them. The per-shot cost is
+-- amortized by classNameCache + cuttableYes/No memoization — first shot pays,
+-- every shot after only re-checks new actors.
 local function scan_cuttables(center, radius, skipKeys)
     local hits = {}
     if not center or not radius then return hits end
     local sn2 = get_sn2_statics()
     if not sn2 then return hits end
-    local r2 = radius * radius
+
+    local r2  = radius * radius
     local all = U.try(function() return FindAllOf("Actor") end)
     if not all then return hits end
+
     for _, a in pairs(all) do
         if U.is_valid(a) then
-            -- SN2PickupItem is already handled by scan_pickups via the safe
-            -- router:PickupActor path. Plants on farm trays satisfy both
-            -- queries; routing them through the destroy-then-spawn cuttable
-            -- path destroys the live plant and is what ate users' farms.
-            local cn = U.class_name(a)
-            local is_pickup_class = (cn == "SN2PickupItem")
-            local key = is_pickup_class and "" or actor_key(a)
-            if not is_pickup_class and not (skipKeys and skipKeys[key]) then
-                local loc = U.actor_location(a)
-                if loc then
-                    local d2 = U.vec_dist_sq(center, loc)
-                    if d2 and d2 <= r2 and not loc_is_recent(loc) then
-                        local ok = false
-                        pcall(function() ok = sn2:IsActorCuttable(a) end)
-                        if ok and plant_ready(a) then
-                            table.insert(hits, { actor = a, dist2 = d2 })
-                        end
+            local k = actor_key(a)
+            -- Distance gate first — pure Lua math, no UE call, cheapest possible reject.
+            local loc = U.actor_location(a)
+            if loc then
+                local d2 = U.vec_dist_sq(center, loc)
+                if d2 and d2 <= r2 and not loc_is_recent(loc) then
+                    -- SN2PickupItem is handled by scan_pickups via the safe path.
+                    -- Routing farm plants through the destroy-then-spawn cuttable
+                    -- path is what ate users' crops.
+                    local cn = cached_class_name(a, k)
+                    if cn ~= "SN2PickupItem"
+                        and not (skipKeys and skipKeys[k])
+                        and cached_is_cuttable(sn2, a, k)
+                        and plant_ready(a)
+                    then
+                        table.insert(hits, { actor = a, dist2 = d2 })
                     end
                 end
             end
@@ -191,19 +242,6 @@ local function scan_cuttables(center, radius, skipKeys)
     end
     table.sort(hits, function(x, y) return x.dist2 < y.dist2 end)
     return hits
-end
-
-local kismetSysLibCdo = nil
-
-local function get_kismet_sys_lib()
-    if U.is_valid(kismetSysLibCdo) then return kismetSysLibCdo end
-    local c = U.try(function()
-        return StaticFindObject("/Script/Engine.Default__KismetSystemLibrary")
-    end)
-    if U.is_valid(c) then kismetSysLibCdo = c; return c end
-    c = U.try(function() return FindFirstOf("KismetSystemLibrary") end)
-    if U.is_valid(c) then kismetSysLibCdo = c; return c end
-    return nil
 end
 
 local kismetMathLibCdo = nil
@@ -421,25 +459,20 @@ end
 
 
 local function on_burst(center, radius, pickupStagger, cuttableStagger, postSpawnStagger)
-    if not Config.EnablePickup then return end
-
-    local hits = scan_pickups(center, radius)
-
-    local cuttables = {}
-    if Config.EnableCuttable then
-        local pickupKeys = {}
-        for _, h in ipairs(hits) do
-            pickupKeys[actor_key(h.actor)] = true
-        end
-        cuttables = scan_cuttables(center, radius, pickupKeys)
-    end
-
-    if #hits == 0 and #cuttables == 0 then return end
-
     local pawn = U.get_pawn()
     if not U.is_valid(pawn) then return end
     local router = U.get_inventory_router(pawn)
     if not U.is_valid(router) then return end
+
+    local hits = scan_pickups(center, radius)
+
+    local pickupKeys = {}
+    for _, h in ipairs(hits) do
+        pickupKeys[actor_key(h.actor)] = true
+    end
+    local cuttables = scan_cuttables(center, radius, pickupKeys)
+
+    if #hits == 0 and #cuttables == 0 then return end
 
     if #hits > 0 then
         schedule_pickups(router, hits, mapGen, pickupStagger)
@@ -533,7 +566,6 @@ local v1HookInstalled = false
 
 local function on_v1_blast_sync(self, GameplayCueTag)
     if isShuttingDown then return end
-    if not (Config.EnableV1Hook == true) then return end
 
     local tagName
     pcall(function() tagName = GameplayCueTag.TagName:ToString() end)
@@ -592,7 +624,6 @@ local function try_install_v1_blast_hook(attempt, gen)
     attempt = attempt or 1
     gen     = gen or mapGen
     if isShuttingDown or gen ~= mapGen or v1HookInstalled then return end
-    if not (Config.EnableV1Hook == true) then return end
     local cls = U.try(function()
         return StaticFindObject("/Script/GameplayAbilities.AbilitySystemComponent")
     end)
@@ -626,6 +657,7 @@ RegisterLoadMapPostHook(function()
     lastPopMs        = 0
     pickedRecent     = {}
     recentLocs       = {}
+    clear_actor_caches()
     isShuttingDown   = false
 
     try_install_pop_hook(1, mapGen)

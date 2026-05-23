@@ -4,12 +4,6 @@ return {
     VERSION       = "1.1.0",
     LOG_PREFIX = "[FloraResonator]",
 
-    -- Master switches. Both harvest mechanics are on by default — covering
-    -- both is the whole point of the mod.
-    EnablePickup   = true,    -- "press E" harvest (SN2PickupItem)
-    EnableCuttable = true,    -- multitool-style break + grab (coral, anemone, etc.)
-    EnableV1Hook   = true,    -- support basic (V1) Sonic Resonator
-
     -- Per-burst caps. 0 = no cap.
     MaxPerBurst          = 0,
     MaxCuttablesPerBurst = 8,
