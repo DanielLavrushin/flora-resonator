@@ -493,9 +493,17 @@ local function on_v1_blast_sync(self, GameplayCueTag)
     if not loc then return end
     local center = { X = loc.X, Y = loc.Y, Z = loc.Z }
 
-    local radius = (Config.V1Radius and Config.V1Radius > 0)
-        and Config.V1Radius
-        or 350.0
+    -- V1's actual radius lives in TunableData (GA_SonicResonator_Blast_C
+    -- pulls it via GetTunableData_Value at fire time), so we can't read it
+    -- the way we read V2's SonicBubblePopRadius CDO field. Fall back to
+    -- V2's CDO value — V1 and V2 share the same balance lineage, so it's
+    -- a reasonable proxy. Set Config.V1Radius > 0 to override.
+    local radius
+    if (Config.V1Radius or 0) > 0 then
+        radius = Config.V1Radius
+    else
+        radius = get_vanilla_radius() or (Config.FallbackRadius or 250.0)
+    end
 
     dedup_gc()
 
