@@ -3,7 +3,7 @@
 -- other file needs to change.
 
 return {
-    VERSION       = "0.5.3",
+    VERSION       = "0.5.5",
 
     -- Verbose logging of every Pop / dump.
     Debug         = true,
@@ -28,13 +28,29 @@ return {
     CuttableStaggerMs = 80,
 
     -- Only harvest plants whose UWEPlantGrowerComponent reports growth
-    -- >= this fraction (1.0 = fully grown). GrowBed plants regrow at 0%
-    -- after harvest; without this gate the next burst sees the fresh
-    -- regrowing actors and "harvests" them too, free-farming the player.
-    -- Actors with no UWEPlantGrowerComponent (wild plants) are always
-    -- considered ready. 1.0 = strict; 0.95 = allow nearly-ripe; 0.0 =
-    -- disable the gate.
+    -- >= this fraction (1.0 = fully grown). Covers plants like
+    -- BP_Freesia_CuttableRegrowingFlower_C where the cuttable IS the
+    -- growing thing. Doesn't cover fruit-on-parent plants (Necrolei,
+    -- Cherimoya) — those use the location dedup below.
+    -- Actors with no UWEPlantGrowerComponent are always considered ready.
     MinGrowthPct  = 1.0,
+
+    -- World-space dedup for harvested locations. After we harvest a
+    -- cuttable at (X,Y,Z), any future scan that finds another actor
+    -- within HarvestLocRadiusCm of that point is skipped for
+    -- HarvestLocTtlMs.
+    --
+    -- Why this exists: fruit-on-parent plants (Necrolei, Cherimoya) spawn
+    -- a new fruit at the same world slot a second or two after harvest.
+    -- The fruit has no growth component, so MinGrowthPct can't gate it;
+    -- but its location matches the slot we just emptied, so this does.
+    --
+    -- Radius is per growbed slot — each plant slot is well spaced (~50cm
+    -- minimum), so 30cm catches respawns without bleeding into neighbors.
+    -- TTL of 60s is the rough natural regrowth interval; after that the
+    -- player has presumably moved on.
+    HarvestLocRadiusCm = 30.0,
+    HarvestLocTtlMs    = 60000,
 
     -- Stagger between successive pickups inside one Pop, in milliseconds.
     -- 0 fires them all in the same tick (faster but riskier for the
@@ -89,5 +105,5 @@ return {
     -- Set to "" to disable.
     PickupToggleKey = "F8",
 
-    LOG_PREFIX    = "[Harvester]",
+    LOG_PREFIX    = "[FloraResonator]",
 }

@@ -1,28 +1,31 @@
--- Harvester — main.lua
+-- Flora Resonator — main.lua
 -- ─────────────────────────────────────────────────────────────────────────
--- v0.3.0: harvest is back on, narrowed to SN2PickupItem instances.
+-- Extends the Sonic Resonator: when the orb pops it auto-harvests every
+-- flora pickup-able actor inside the burst radius, plus triggers a full
+-- "cuttable" break on multitool-style plants (one shot = all drops).
 --
 -- Flow per Sonic Resonator burst:
 --   1. Hook BP_SonicBubbleProjectile_C:Pop. Inside the callback, extract
---      the orb's location & SonicBubblePopRadius as plain Lua numbers
---      SYNCHRONOUSLY — UE4SS's `self` hook param is only valid for the
---      duration of this callback; touching it from a deferred block
---      crashes the game (the v0.1 crash).
---   2. Defer to the next game-thread tick with those plain numbers.
---   3. FindAllOf("SN2PickupItem") → distance filter → list of targets.
---      (SN2PickupItem proved exact in v0.2: catches every pickup-able
---      plant/fruit/sac we want and nothing else — no lockers/lights/etc.)
---   4. If EnablePickup is on, call router:PickupActor(target, {})
---      staggered by PickupStaggerMs so a 24-item burst doesn't fire 24
---      RPCs in one tick.
+--      the orb's location SYNCHRONOUSLY — UE4SS's `self` hook param is
+--      only valid for the duration of this callback; touching it from a
+--      deferred block crashes the game.
+--   2. Defer to the next game-thread tick with plain Lua numbers.
+--   3. Run two probes at the pop location:
+--        • FindAllOf("SN2PickupItem")       — hand-pickup items (E key)
+--        • FindAllOf("Actor") + IsActorCuttable — multitool plants
+--   4. Both paths gate on:
+--        a) UWEPlantGrowerComponent growth % (covers plants that grow
+--           in place, e.g. Freesia)
+--        b) world-space slot dedup with TTL (covers fruit-on-parent
+--           plants like Necrolei/Cherimoya where a fresh fruit spawns
+--           at the same slot a second after harvest)
+--   5. Pickups go through router:PickupActor staggered; cuttables
+--      spawn N copies of ResourceClass + destroy the source, then pick
+--      up the spawned drops.
 --
--- Console:
---   • harvest status                  state + counts
---   • harvest dump                    enumerate nearby pickupables (no shot)
---   • harvest pickup on|off|toggle    runtime flip of EnablePickup
---
--- Key:
---   • F7 (configurable)               manual dump
+-- Keys (configurable in config.lua):
+--   • F7 — manual dump (no shot fired)
+--   • F8 — toggle EnablePickup on/off mid-game
 
 local Config = require("config")
 local U      = require("util")
@@ -85,6 +88,13 @@ end
 -- lazily during scans so we don't need a background timer.
 local pickedRecent    = {}
 
+-- World-space dedup: array of { x, y, z, expiry } recording recently
+-- harvested points. Catches the case where the game respawns a fresh
+-- fruit/plant at the same slot 1–2s after we harvested it — no actor
+-- match, but the location is identical. See HarvestLocRadiusCm /
+-- HarvestLocTtlMs in config.
+local recentLocs      = {}
+
 local function now_ms()
     return math.floor(os.clock() * 1000)
 end
@@ -118,36 +128,37 @@ local function dedup_gc()
     for k, exp in pairs(pickedRecent) do
         if t >= exp then pickedRecent[k] = nil end
     end
+    for i = #recentLocs, 1, -1 do
+        if t >= recentLocs[i].expiry then table.remove(recentLocs, i) end
+    end
 end
 
--- ── Discovery ────────────────────────────────────────────────────────────
+local function remember_loc(loc)
+    if not loc or type(loc.X) ~= "number" then return end
+    table.insert(recentLocs, {
+        x = loc.X, y = loc.Y, z = loc.Z,
+        expiry = now_ms() + (Config.HarvestLocTtlMs or 60000),
+    })
+end
 
-local function scan_pickups(center, radius)
-    local hits = {}
-    if not center or not radius then return hits end
-    local r2 = radius * radius
-    local all = U.try(function() return FindAllOf("SN2PickupItem") end)
-    if not all then return hits end
-    for _, a in pairs(all) do
-        if U.is_valid(a) then
-            local loc = U.actor_location(a)
-            if loc then
-                local d2 = U.vec_dist_sq(center, loc)
-                if d2 and d2 <= r2 then
-                    local ready, pct = plant_ready(a)
-                    if ready then
-                        table.insert(hits, { actor = a, dist2 = d2 })
-                    else
-                        U.dlogf("  -PICK skip %s (growth %.0f%%)",
-                            safe_class_name(a), (pct or 0) * 100)
-                    end
-                end
-            end
+local function loc_is_recent(loc)
+    if not loc or type(loc.X) ~= "number" then return false end
+    local r2 = (Config.HarvestLocRadiusCm or 30) ^ 2
+    if r2 <= 0 then return false end
+    local t = now_ms()
+    for i = #recentLocs, 1, -1 do
+        local rl = recentLocs[i]
+        if t >= rl.expiry then
+            table.remove(recentLocs, i)
+        else
+            local dx, dy, dz = loc.X - rl.x, loc.Y - rl.y, loc.Z - rl.z
+            if dx*dx + dy*dy + dz*dz <= r2 then return true end
         end
     end
-    table.sort(hits, function(x, y) return x.dist2 < y.dist2 end)
-    return hits
+    return false
 end
+
+-- ── Common helpers ───────────────────────────────────────────────────────
 
 local function safe_class_name(actor)
     local cn = U.try(function() return actor:GetClass():GetFName():ToString() end)
@@ -191,6 +202,43 @@ local function plant_ready(actor)
     return grown == true
 end
 
+-- ── Discovery: SN2PickupItem ─────────────────────────────────────────────
+
+local function scan_pickups(center, radius)
+    local hits = {}
+    if not center or not radius then return hits end
+    local r2 = radius * radius
+    local all = U.try(function() return FindAllOf("SN2PickupItem") end)
+    if not all then return hits end
+    for _, a in pairs(all) do
+        if U.is_valid(a) then
+            local loc = U.actor_location(a)
+            if loc then
+                local d2 = U.vec_dist_sq(center, loc)
+                if d2 and d2 <= r2 then
+                    if loc_is_recent(loc) then
+                        U.dlogf("  -PICK skip %s (recently harvested at this slot)",
+                            safe_class_name(a))
+                    else
+                        local ready, pct = plant_ready(a)
+                        if ready then
+                            -- Stash loc so schedule_pickups can record it
+                            -- after a successful pickup (the actor may be
+                            -- invalidated by then).
+                            table.insert(hits, { actor = a, dist2 = d2, loc = loc })
+                        else
+                            U.dlogf("  -PICK skip %s (growth %.0f%%)",
+                                safe_class_name(a), (pct or 0) * 100)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    table.sort(hits, function(x, y) return x.dist2 < y.dist2 end)
+    return hits
+end
+
 -- ── Cuttable scan + harvest ──────────────────────────────────────────────
 
 -- Iterate every Actor in range and ask SN2Statics:IsActorCuttable for each.
@@ -214,12 +262,17 @@ local function scan_cuttables(center, radius)
                     local ok = false
                     pcall(function() ok = sn2:IsActorCuttable(a) end)
                     if ok == true then
-                        local ready, pct = plant_ready(a)
-                        if ready then
-                            table.insert(hits, { actor = a, dist2 = d2 })
+                        if loc_is_recent(loc) then
+                            U.dlogf("  -CUT  skip %s (recently harvested at this slot)",
+                                safe_class_name(a))
                         else
-                            U.dlogf("  -CUT  skip %s (growth %.0f%%)",
-                                safe_class_name(a), (pct or 0) * 100)
+                            local ready, pct = plant_ready(a)
+                            if ready then
+                                table.insert(hits, { actor = a, dist2 = d2 })
+                            else
+                                U.dlogf("  -CUT  skip %s (growth %.0f%%)",
+                                    safe_class_name(a), (pct or 0) * 100)
+                            end
                         end
                     end
                 end
@@ -377,9 +430,17 @@ local function harvest_one_cuttable(cuttable, pawn, router, sn2)
 
     U.dlogf("  +CUT  %s spawned=%d/%d resource=%s", cn, #spawned, n_hits, res_name)
 
-    -- Remember the cuttable itself too — same actor might still show up in
-    -- the next scan before DestroyActor propagates.
+    -- Remember the cuttable itself (FullName) AND the world location.
+    -- FullName covers the case where DestroyActor hasn't propagated yet
+    -- and the same actor shows up in the next scan. Location covers the
+    -- fruit-on-parent case (Necrolei, Cherimoya) where the parent spawns
+    -- a fresh actor at the same slot a second later — different actor,
+    -- different FullName, same location.
     dedup_remember(cuttable)
+    do
+        local hloc = U.actor_location(cuttable)
+        if hloc then remember_loc(hloc) end
+    end
     pcall(function() cuttable:K2_DestroyActor() end)
 
     -- Pick each spawned item up after a short delay, staggered so the
@@ -538,6 +599,9 @@ local function schedule_pickups(router, hits, gen)
             elseif try_pickup(router, h.actor) then
                 picked = picked + 1
                 dedup_remember(h.actor)
+                -- Use the loc captured at scan time — the actor may already
+                -- be invalidated by PickupActor by this point.
+                if h.loc then remember_loc(h.loc) end
                 U.dlogf("  +PICK %s (d=%.0f)", cn, math.sqrt(h.dist2))
             else
                 failed = failed + 1
@@ -707,6 +771,7 @@ RegisterLoadMapPostHook(function()
     hookInstalled  = false
     lastPopMs      = 0
     pickedRecent   = {}
+    recentLocs     = {}
     isShuttingDown = false
 
     try_install_pop_hook(1, mapGen)
@@ -785,38 +850,7 @@ do
     end
 end
 
--- ── Console ─────────────────────────────────────────────────────────────
-
-RegisterConsoleCommandHandler("harvest", function(FullCommand, Parameters, OutputDevice)
-    local arg1 = (Parameters and Parameters[1] or ""):lower()
-    local arg2 = (Parameters and Parameters[2] or ""):lower()
-    if arg1 == "status" then
-        local dedup_n = 0
-        for _ in pairs(pickedRecent) do dedup_n = dedup_n + 1 end
-        U.logf("v%s  hookInstalled=%s mapGen=%d EnablePickup=%s stagger=%dms cap=%d radius=%.0f debounce=%dms dedupWin=%dms dedupSize=%d",
-            Config.VERSION, tostring(hookInstalled), mapGen,
-            tostring(enablePickup), Config.PickupStaggerMs or 0,
-            Config.MaxPerBurst or 0,
-            (Config.RadiusOverride or 0) > 0 and Config.RadiusOverride
-                or get_vanilla_radius() or (Config.FallbackRadius or 250),
-            Config.PopDebounceMs or 0, Config.PickDedupMs or 0, dedup_n)
-    elseif arg1 == "dump" then
-        ExecuteInGameThread(function() manual_dump() end)
-    elseif arg1 == "pickup" then
-        if arg2 == "on" or arg2 == "true" or arg2 == "1" then
-            enablePickup = true
-        elseif arg2 == "off" or arg2 == "false" or arg2 == "0" then
-            enablePickup = false
-        elseif arg2 == "toggle" or arg2 == "" then
-            enablePickup = not enablePickup
-        end
-        U.logf("EnablePickup = %s", tostring(enablePickup))
-    else
-        U.logf("usage: harvest status | dump | pickup on|off|toggle")
-    end
-    return true
-end)
-
-U.logf("loaded v%s — EnablePickup=%s (toggle: `harvest pickup on`)",
-    Config.VERSION, tostring(enablePickup))
+U.logf("loaded v%s — EnablePickup=%s (toggle: %s)",
+    Config.VERSION, tostring(enablePickup),
+    Config.PickupToggleKey ~= "" and Config.PickupToggleKey or "config only")
 try_install_pop_hook(1, mapGen)
