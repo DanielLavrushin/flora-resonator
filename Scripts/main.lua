@@ -265,7 +265,8 @@ local function read_cuttable_info(actor, sn2)
     return data, hits, res_cls
 end
 
-local function harvest_one_cuttable(cuttable, pawn, router, sn2)
+local function harvest_one_cuttable(cuttable, pawn, router, sn2, postSpawnStagger)
+    postSpawnStagger = postSpawnStagger or 80
     if not U.is_valid(cuttable) then return false end
 
     local data, n_hits, res_cls = read_cuttable_info(cuttable, sn2)
@@ -297,21 +298,28 @@ local function harvest_one_cuttable(cuttable, pawn, router, sn2)
 
     for i, item in ipairs(spawned) do
         local capturedGen = mapGen
-        ExecuteWithDelay(80 * i, function()
-            ExecuteInGameThread(function()
-                if isShuttingDown or capturedGen ~= mapGen then return end
-                if U.is_valid(item) then
-                    pcall(function() router:PickupActor(item, {}) end)
-                end
+        if postSpawnStagger <= 0 then
+            if U.is_valid(item) then
+                pcall(function() router:PickupActor(item, {}) end)
+            end
+        else
+            ExecuteWithDelay(postSpawnStagger * i, function()
+                ExecuteInGameThread(function()
+                    if isShuttingDown or capturedGen ~= mapGen then return end
+                    if U.is_valid(item) then
+                        pcall(function() router:PickupActor(item, {}) end)
+                    end
+                end)
             end)
-        end)
+        end
     end
 
     return true
 end
 
-local function schedule_cuttable_harvest(cuttables, pawn, router, sn2, gen)
-    local stagger = Config.CuttableStaggerMs or 80
+local function schedule_cuttable_harvest(cuttables, pawn, router, sn2, gen, stagger, postSpawnStagger)
+    stagger          = stagger          or Config.CuttableStaggerMs or 80
+    postSpawnStagger = postSpawnStagger or 80
     local cap     = Config.MaxCuttablesPerBurst or 0
     local total   = (cap > 0 and math.min(cap, #cuttables)) or #cuttables
 
@@ -320,7 +328,7 @@ local function schedule_cuttable_harvest(cuttables, pawn, router, sn2, gen)
         if i > total then return end
         local c = cuttables[i]
         if c and U.is_valid(c.actor) and not dedup_is_picked(c.actor) then
-            harvest_one_cuttable(c.actor, pawn, router, sn2)
+            harvest_one_cuttable(c.actor, pawn, router, sn2, postSpawnStagger)
         end
 
         if stagger <= 0 then
@@ -343,9 +351,9 @@ local function try_pickup(router, actor)
     return ok
 end
 
-local function schedule_pickups(router, hits, gen)
-    local stagger = Config.PickupStaggerMs or 0
-    local cap     = Config.MaxPerBurst or 0
+local function schedule_pickups(router, hits, gen, stagger)
+    stagger = stagger or Config.PickupStaggerMs or 0
+    local cap = Config.MaxPerBurst or 0
     local total   = (cap > 0 and math.min(cap, #hits)) or #hits
 
     local function step(i)
@@ -372,7 +380,7 @@ local function schedule_pickups(router, hits, gen)
 end
 
 
-local function on_burst(center, radius)
+local function on_burst(center, radius, pickupStagger, cuttableStagger, postSpawnStagger)
     if not Config.EnablePickup then return end
 
     local hits      = scan_pickups(center, radius)
@@ -385,13 +393,14 @@ local function on_burst(center, radius)
     if not U.is_valid(router) then return end
 
     if #hits > 0 then
-        schedule_pickups(router, hits, mapGen)
+        schedule_pickups(router, hits, mapGen, pickupStagger)
     end
 
     if Config.EnableCuttable and #cuttables > 0 then
         local sn2 = get_sn2_statics()
         if sn2 then
-            schedule_cuttable_harvest(cuttables, pawn, router, sn2, mapGen)
+            schedule_cuttable_harvest(cuttables, pawn, router, sn2, mapGen,
+                cuttableStagger, postSpawnStagger)
         end
     end
 end
@@ -493,11 +502,6 @@ local function on_v1_blast_sync(self, GameplayCueTag)
     if not loc then return end
     local center = { X = loc.X, Y = loc.Y, Z = loc.Z }
 
-    -- V1's actual radius lives in TunableData (GA_SonicResonator_Blast_C
-    -- pulls it via GetTunableData_Value at fire time), so we can't read it
-    -- the way we read V2's SonicBubblePopRadius CDO field. Fall back to
-    -- V2's CDO value — V1 and V2 share the same balance lineage, so it's
-    -- a reasonable proxy. Set Config.V1Radius > 0 to override.
     local radius
     if (Config.V1Radius or 0) > 0 then
         radius = Config.V1Radius
@@ -511,7 +515,7 @@ local function on_v1_blast_sync(self, GameplayCueTag)
     ExecuteWithDelay(0, function()
         ExecuteInGameThread(function()
             if isShuttingDown or capturedGen ~= mapGen then return end
-            on_burst(center, radius)
+            on_burst(center, radius, 0, 0, 0)
         end)
     end)
 end
