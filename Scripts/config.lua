@@ -98,12 +98,6 @@ return {
     -- still investigating; turn off once we trust SN2PickupItem.
     ExtraProbes   = false,
 
-    -- When true, F7 also runs the stage-2 recon dump (probe.lua) — scans
-    -- UClasses, DataTables, asset paths and the player's held tool for the
-    -- Modification Station / Feedback Resonator wiring. Turn off once we
-    -- know which approach to use for the craftable Flora Resonator upgrade.
-    ReconDump     = true,
-
     -- Key for the manual dump (no shot fired).
     DebugDumpKey  = "F7",
 
