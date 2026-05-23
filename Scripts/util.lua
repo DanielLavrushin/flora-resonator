@@ -9,10 +9,6 @@ function M.logf(fmt, ...)
     print(string.format(Config.LOG_PREFIX .. " " .. fmt .. "\n", ...))
 end
 
-function M.dlogf(fmt, ...)
-    if Config.Debug then M.logf(fmt, ...) end
-end
-
 function M.try(fn)
     local ok, r = pcall(fn)
     if ok then return r end
