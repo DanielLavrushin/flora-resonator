@@ -29,6 +29,7 @@
 
 local Config = require("config")
 local U      = require("util")
+local Probe  = require("probe")
 
 -- ── State ────────────────────────────────────────────────────────────────
 
@@ -697,6 +698,10 @@ local function on_pop_sync(self)
         if not (proj and proj:IsValid()) then return end
         local loc = proj:K2_GetActorLocation()
         if loc and type(loc.X) == "number" then cx, cy, cz = loc.X, loc.Y, loc.Z end
+        -- Stage-2 recon: if armed by F7, dump this projectile's Owner /
+        -- Instigator now (while `self` is still valid). Reveals the real
+        -- Sonic Resonator class path so we can stop guessing.
+        pcall(function() Probe.capture_from_projectile(proj) end)
     end)
 
     if not cx then return end
@@ -812,6 +817,13 @@ local function manual_dump()
         local r2 = radius * radius
         log_class_tally("Dump [Actor]",     probe_all_actors(loc, r2))
         log_class_tally("Dump [Interface]", probe_interface(loc, r2))
+    end
+
+    -- Stage-2 recon: figure out the Modification Station / Feedback
+    -- Resonator wiring so we can gate the harvest on a crafted upgrade.
+    -- Safe to call every F7 — pure reads, no game-state mutations.
+    if Config.ReconDump then
+        pcall(function() Probe.dump() end)
     end
 end
 
